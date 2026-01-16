@@ -1,13 +1,13 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { generateRevolutionarySpeech, generatePoemText } from './services/geminiService';
 import { FULL_POEM_TEXT } from './types';
 import { AudioPlayer } from './components/AudioPlayer';
-import * as lamejs from 'lamejs';
 
 type AppMode = 'GENERATE' | 'EDIT';
 
 const App: React.FC = () => {
   const [mode, setMode] = useState<AppMode>('GENERATE');
+  const [hasKey, setHasKey] = useState<boolean | null>(null);
   
   // Generation State
   const [topic, setTopic] = useState('');
@@ -30,53 +30,81 @@ const App: React.FC = () => {
   const bgBlob2Ref = useRef<HTMLDivElement>(null);
   const smoothedIntensityRef = useRef(0);
 
-  // Convert AudioBuffer to MP3 Blob using lamejs
+  // Initial Key Check
+  useEffect(() => {
+    const checkKey = async () => {
+      if (typeof (window as any).aistudio?.hasSelectedApiKey === 'function') {
+        const selected = await (window as any).aistudio.hasSelectedApiKey();
+        setHasKey(selected);
+      } else {
+        setHasKey(true); // Fallback if environment doesn't use selection logic
+      }
+    };
+    checkKey();
+  }, []);
+
+  const handleOpenKeySelector = async () => {
+    if (typeof (window as any).aistudio?.openSelectKey === 'function') {
+      await (window as any).aistudio.openSelectKey();
+      setHasKey(true); // Proceed assuming success
+    }
+  };
+
+  /**
+   * Optimized MP3 encoding using the global lamejs library
+   */
   const audioBufferToMp3 = async (buffer: AudioBuffer): Promise<Blob> => {
     const channels = buffer.numberOfChannels;
     const sampleRate = buffer.sampleRate;
-    // @ts-ignore - lamejs typings can be tricky via ESM
-    const mp3encoder = new lamejs.Mp3Encoder(channels, sampleRate, 128);
+    const bitrate = 96; 
+    
+    // Access lamejs from window to avoid scoping issues with its internal constants
+    const lame = (window as any).lamejs;
+    if (!lame) {
+      throw new Error("lamejs library not loaded properly.");
+    }
+    
+    const mp3encoder = new lame.Mp3Encoder(channels, sampleRate, bitrate);
     const mp3Data: any[] = [];
-
     const samplesL = buffer.getChannelData(0);
-    const samplesR = channels > 1 ? buffer.getChannelData(1) : samplesL;
+    const samplesR = channels > 1 ? buffer.getChannelData(1) : null;
 
-    // Convert Float32 to Int16
     const floatTo16BitPCM = (input: Float32Array) => {
       const output = new Int16Array(input.length);
       for (let i = 0; i < input.length; i++) {
-        const s = Math.max(-1, Math.min(1, input[i]));
+        const s = input[i];
         output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
       }
       return output;
     };
 
     const left = floatTo16BitPCM(samplesL);
-    const right = floatTo16BitPCM(samplesR);
-
+    const right = samplesR ? floatTo16BitPCM(samplesR) : null;
     const sampleBlockSize = 1152;
+
     for (let i = 0; i < left.length; i += sampleBlockSize) {
       const leftChunk = left.subarray(i, i + sampleBlockSize);
-      const rightChunk = right.subarray(i, i + sampleBlockSize);
-      const mp3buf = mp3encoder.encodeBuffer(leftChunk, rightChunk);
-      if (mp3buf.length > 0) {
-        mp3Data.push(mp3buf);
+      let mp3buf;
+      if (right) {
+        const rightChunk = right.subarray(i, i + sampleBlockSize);
+        mp3buf = mp3encoder.encodeBuffer(leftChunk, rightChunk);
+      } else {
+        mp3buf = mp3encoder.encodeBuffer(leftChunk);
       }
+      if (mp3buf.length > 0) mp3Data.push(mp3buf);
     }
 
     const mp3buf = mp3encoder.flush();
-    if (mp3buf.length > 0) {
-      mp3Data.push(mp3buf);
-    }
-
+    if (mp3buf.length > 0) mp3Data.push(mp3buf);
     return new Blob(mp3Data, { type: 'audio/mp3' });
   };
 
   const handleDownload = async () => {
     if (!audioBuffer) return;
-    
     setIsDownloading(true);
+    setError(null);
     try {
+      await new Promise(r => setTimeout(r, 50));
       const blob = await audioBufferToMp3(audioBuffer);
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
@@ -86,9 +114,9 @@ const App: React.FC = () => {
       anchor.click();
       document.body.removeChild(anchor);
       URL.revokeObjectURL(url);
-    } catch (err) {
+    } catch (err: any) {
       console.error("Download failed:", err);
-      setError("MP3 generation failed. Please try again.");
+      setError(`Download failed: ${err.message || "Unknown error"}`);
     } finally {
       setIsDownloading(false);
     }
@@ -96,7 +124,7 @@ const App: React.FC = () => {
 
   const handleTextGeneration = async () => {
     if (!topic.trim()) {
-      setError("Please enter a topic for the poem.");
+      setError("Please enter a topic.");
       return;
     }
     
@@ -109,7 +137,12 @@ const App: React.FC = () => {
       setMode('EDIT');
     } catch (err: any) {
       console.error(err);
-      setError("Failed to generate poem. Please try again.");
+      if (err.message?.includes("Requested entity was not found")) {
+        setHasKey(false);
+        setError("API authentication failed. Please select your API key.");
+      } else {
+        setError("Poem generation failed. Please try again or check your API key.");
+      }
     } finally {
       setIsGeneratingText(false);
     }
@@ -117,7 +150,7 @@ const App: React.FC = () => {
 
   const handleGenerateAndPlay = async () => {
     if (!poemText.trim()) {
-        setError("Please enter some text for the manifesto.");
+        setError("Text is empty.");
         return;
     }
 
@@ -130,54 +163,69 @@ const App: React.FC = () => {
       setAudioBuffer(buffer);
     } catch (err: any) {
       console.error(err);
-      setError(err.message || "Failed to generate speech. Please try again.");
+      if (err.message?.includes("Requested entity was not found")) {
+        setHasKey(false);
+        setError("API authentication failed. Please select your API key.");
+      } else {
+        setError(err.message || "Failed to generate speech. Ensure you have selected a valid project API key.");
+      }
     } finally {
       setIsLoadingAudio(false);
     }
   };
 
   const handleIntensityChange = (intensity: number) => {
-    if (redPulseRef.current) {
-        const opacity = Math.pow(intensity, 1.5) * 0.8; 
-        redPulseRef.current.style.opacity = opacity.toString();
-    }
+    if (redPulseRef.current) redPulseRef.current.style.opacity = (Math.pow(intensity, 1.5) * 0.8).toString();
     if (splatterRef.current) {
-        const scale = 1 + (intensity * 0.2);
-        const opacity = 0.3 + (Math.pow(intensity, 2) * 0.6);
-        splatterRef.current.style.transform = `translate(-50%, -50%) scale(${scale})`;
-        splatterRef.current.style.opacity = opacity.toString();
+        splatterRef.current.style.transform = `translate(-50%, -50%) scale(${1 + (intensity * 0.2)})`;
+        splatterRef.current.style.opacity = (0.3 + (Math.pow(intensity, 2) * 0.6)).toString();
     }
     if (containerRef.current) {
         if (intensity > 0.4) {
-            const shakeAmount = (intensity - 0.4) * 10;
-            const x = (Math.random() - 0.5) * shakeAmount;
-            const y = (Math.random() - 0.5) * shakeAmount;
-            const rotate = (Math.random() - 0.5) * (intensity * 0.5);
-            containerRef.current.style.transform = `translate(${x}px, ${y}px) rotate(${rotate}deg)`;
+            const shake = (intensity - 0.4) * 10;
+            containerRef.current.style.transform = `translate(${(Math.random()-0.5)*shake}px, ${(Math.random()-0.5)*shake}px) rotate(${(Math.random()-0.5)*intensity*0.5}deg)`;
         } else {
             containerRef.current.style.transform = 'none';
         }
     }
-    smoothedIntensityRef.current = smoothedIntensityRef.current + (intensity - smoothedIntensityRef.current) * 0.05;
-    const smoothVal = smoothedIntensityRef.current;
-    if (bgBlob1Ref.current) bgBlob1Ref.current.style.transform = `translate(${smoothVal * -50}px, ${smoothVal * -30}px) scale(${1 + smoothVal * 0.1})`;
-    if (bgBlob2Ref.current) bgBlob2Ref.current.style.transform = `translate(${smoothVal * 50}px, ${smoothVal * 30}px) scale(${1 + smoothVal * 0.15})`;
+    smoothedIntensityRef.current += (intensity - smoothedIntensityRef.current) * 0.05;
+    const sVal = smoothedIntensityRef.current;
+    if (bgBlob1Ref.current) bgBlob1Ref.current.style.transform = `translate(${sVal * -50}px, ${sVal * -30}px) scale(${1 + sVal * 0.1})`;
+    if (bgBlob2Ref.current) bgBlob2Ref.current.style.transform = `translate(${sVal * 50}px, ${sVal * 30}px) scale(${1 + sVal * 0.15})`;
   };
+
+  if (hasKey === false) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-black p-6 text-center">
+        <h1 className="text-3xl font-black text-red-500 mb-6 uppercase tracking-widest">API Key Required</h1>
+        <p className="text-neutral-400 max-w-md mb-8">
+          To generate revolutionary poems and high-quality voiceovers, you must select an API key from a paid GCP project.
+          <br/><br/>
+          Visit <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" className="text-red-400 underline">billing documentation</a> for details.
+        </p>
+        <button 
+          onClick={handleOpenKeySelector}
+          className="px-8 py-4 bg-red-600 text-white font-bold rounded uppercase tracking-widest hover:bg-red-700 transition-colors shadow-[0_0_20px_rgba(220,38,38,0.5)]"
+        >
+          Select API Key
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen w-full relative overflow-x-hidden selection:bg-red-700 selection:text-white pb-20">
       {/* Background Ambience */}
       <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
-        <div ref={bgBlob1Ref} className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-red-900/20 rounded-full blur-[100px] will-change-transform" />
-        <div ref={bgBlob2Ref} className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-red-900/10 rounded-full blur-[100px] will-change-transform" />
-        <div ref={redPulseRef} className="absolute inset-0 bg-gradient-radial from-red-600/60 via-transparent to-transparent mix-blend-overlay transition-opacity duration-75" style={{ opacity: 0 }} />
-        <div ref={splatterRef} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[110%] h-[110%] blood-splatter transition-transform duration-75 ease-out" style={{ opacity: 0.3 }} />
+        <div ref={bgBlob1Ref} className="absolute top-[-10%] left-[-10%] w-[50%] h-[50%] bg-red-900/20 rounded-full blur-[100px]" />
+        <div ref={bgBlob2Ref} className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-red-900/10 rounded-full blur-[100px]" />
+        <div ref={redPulseRef} className="absolute inset-0 bg-gradient-radial from-red-600/60 via-transparent to-transparent mix-blend-overlay opacity-0" />
+        <div ref={splatterRef} className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[110%] h-[110%] blood-splatter opacity-30" />
         <div className="absolute inset-0 bg-[radial-gradient(circle,transparent_40%,rgba(0,0,0,0.8)_100%)]" />
       </div>
 
-      <div ref={containerRef} className="relative z-10 max-w-4xl mx-auto px-4 md:px-6 py-12 flex flex-col items-center transition-transform duration-75">
+      <div ref={containerRef} className="relative z-10 max-w-4xl mx-auto px-4 md:px-6 py-12 flex flex-col items-center">
         
-        {/* Header */}
         <header className="mb-8 text-center space-y-4 w-full">
           <div className="inline-block border-b-4 border-red-600 pb-2 mb-2">
             <h1 className="text-4xl md:text-6xl font-black text-red-500 tracking-tighter uppercase drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)]">
@@ -189,7 +237,6 @@ const App: React.FC = () => {
           </p>
         </header>
 
-        {/* Mode Switcher */}
         <div className="flex gap-4 mb-8 bg-black/40 p-1 rounded-lg border border-red-900/30">
           <button 
             onClick={() => setMode('GENERATE')}
@@ -206,9 +253,8 @@ const App: React.FC = () => {
         </div>
 
         <main className="w-full relative group">
-          
           {mode === 'GENERATE' ? (
-             <div className="w-full bg-black/20 border-2 border-red-900/30 rounded-lg p-6 md:p-8 space-y-6 backdrop-blur-sm animate-in fade-in slide-in-from-bottom-4 duration-500">
+             <div className="w-full bg-black/20 border-2 border-red-900/30 rounded-lg p-6 md:p-8 space-y-6 backdrop-blur-sm animate-in fade-in slide-in-from-bottom-4">
                 <div className="grid md:grid-cols-2 gap-6">
                   <div className="space-y-2">
                     <label className="text-red-400 text-xs uppercase tracking-widest">Topic (বিষয়)</label>
@@ -217,7 +263,7 @@ const App: React.FC = () => {
                       value={topic}
                       onChange={(e) => setTopic(e.target.value)}
                       placeholder="e.g., Revolution, Rain, Lost Love..."
-                      className="w-full bg-black/40 border border-red-900/30 rounded p-4 text-white placeholder-neutral-600 focus:border-red-500 focus:outline-none focus:ring-1 focus:ring-red-500 transition-all"
+                      className="w-full bg-black/40 border border-red-900/30 rounded p-4 text-white focus:border-red-500 outline-none"
                     />
                   </div>
                   <div className="space-y-2">
@@ -225,7 +271,7 @@ const App: React.FC = () => {
                     <select 
                       value={mood}
                       onChange={(e) => setMood(e.target.value)}
-                      className="w-full bg-black/40 border border-red-900/30 rounded p-4 text-white focus:border-red-500 focus:outline-none transition-all"
+                      className="w-full bg-black/40 border border-red-900/30 rounded p-4 text-white focus:border-red-500 outline-none"
                     >
                       <option value="Biplobi (Revolutionary)">Biplobi (Revolutionary)</option>
                       <option value="Prem (Romantic)">Prem (Romantic)</option>
@@ -242,7 +288,7 @@ const App: React.FC = () => {
                    <select 
                       value={style}
                       onChange={(e) => setStyle(e.target.value)}
-                      className="w-full bg-black/40 border border-red-900/30 rounded p-4 text-white focus:border-red-500 focus:outline-none transition-all"
+                      className="w-full bg-black/40 border border-red-900/30 rounded p-4 text-white focus:border-red-500 outline-none"
                     >
                       <option value="Kazi Nazrul Islam (Rebel/Powerful)">Kazi Nazrul Islam (Rebel/Powerful)</option>
                       <option value="Rabindranath Tagore (Lyrical/Deep)">Rabindranath Tagore (Lyrical/Deep)</option>
@@ -256,45 +302,28 @@ const App: React.FC = () => {
                   <button
                     onClick={handleTextGeneration}
                     disabled={isGeneratingText || !topic.trim()}
-                    className="relative w-full md:w-auto px-12 py-4 bg-red-900/20 border border-red-500/50 text-red-100 font-bold uppercase tracking-widest hover:bg-red-800/30 hover:shadow-[0_0_20px_rgba(220,38,38,0.4)] transition-all disabled:opacity-50 disabled:cursor-not-allowed group"
+                    className="relative w-full md:w-auto px-12 py-4 bg-red-900/20 border border-red-500/50 text-red-100 font-bold uppercase tracking-widest hover:bg-red-800/30 transition-all disabled:opacity-50"
                   >
-                    {isGeneratingText ? (
-                      <span className="flex items-center gap-2">
-                        <span className="w-2 h-2 bg-red-500 rounded-full animate-bounce" />
-                        <span className="w-2 h-2 bg-red-500 rounded-full animate-bounce delay-75" />
-                        <span className="w-2 h-2 bg-red-500 rounded-full animate-bounce delay-150" />
-                        Generating Poem...
-                      </span>
-                    ) : "Generate Poem"}
+                    {isGeneratingText ? "Generating Poem..." : "Generate Poem"}
                   </button>
                 </div>
              </div>
           ) : (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div className="animate-in fade-in slide-in-from-bottom-4">
                <textarea
                 value={poemText}
                 onChange={(e) => setPoemText(e.target.value)}
-                className="w-full h-[50vh] bg-black/20 border-2 border-red-900/30 rounded-lg p-6 md:p-8 text-lg md:text-2xl text-center leading-relaxed text-neutral-200 font-medium focus:border-red-600 focus:outline-none focus:bg-red-950/10 transition-all duration-300 resize-none font-serif placeholder-red-900/50 shadow-[inset_0_0_20px_rgba(0,0,0,0.5)] z-20 relative"
+                className="w-full h-[50vh] bg-black/20 border-2 border-red-900/30 rounded-lg p-6 md:p-8 text-lg md:text-2xl text-center text-neutral-200 font-medium focus:border-red-600 outline-none resize-none font-serif shadow-[inset_0_0_20px_rgba(0,0,0,0.5)]"
                 placeholder="Write your poem here..."
                 spellCheck="false"
               />
-              <div className="flex justify-between mt-2 px-2">
-                 <span className="text-xs text-neutral-500">Bangla supported</span>
-                 <span className="text-xs text-red-500/50 uppercase tracking-widest">Editable</span>
-              </div>
             </div>
           )}
-
-          <div className="absolute top-0 left-0 w-4 h-4 border-t-2 border-l-2 border-red-600 pointer-events-none opacity-50" />
-          <div className="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-red-600 pointer-events-none opacity-50" />
-          <div className="absolute bottom-0 left-0 w-4 h-4 border-b-2 border-l-2 border-red-600 pointer-events-none opacity-50" />
-          <div className="absolute bottom-0 right-0 w-4 h-4 border-b-2 border-r-2 border-red-600 pointer-events-none opacity-50" />
         </main>
 
         <div className="mt-10 w-full flex flex-col items-center space-y-6">
-          
           {error && (
-            <div className="p-4 border border-red-500/50 bg-red-900/20 text-red-200 rounded text-sm max-w-md text-center animate-pulse">
+            <div className="p-4 border border-red-500/50 bg-red-900/20 text-red-200 rounded text-sm text-center animate-pulse">
               {error}
             </div>
           )}
@@ -303,46 +332,22 @@ const App: React.FC = () => {
             <button
               onClick={handleGenerateAndPlay}
               disabled={isLoadingAudio || !poemText.trim()}
-              className={`
-                relative px-8 py-4 bg-transparent border-2 border-red-600 
-                text-red-500 font-bold text-xl uppercase tracking-[0.2em]
-                transition-all duration-300 transform
-                disabled:opacity-50 disabled:cursor-not-allowed
-                hover:bg-red-600 hover:text-white hover:shadow-[0_0_20px_rgba(220,38,38,0.6)]
-                active:scale-95
-                ${isLoadingAudio ? 'animate-pulse' : ''}
-              `}
+              className="px-8 py-4 border-2 border-red-600 text-red-500 font-bold text-xl uppercase tracking-widest hover:bg-red-600 hover:text-white transition-all disabled:opacity-50"
             >
-              <span className="relative z-10">
-                {isLoadingAudio ? " কণ্ঠস্বর প্রস্তুত..." : "আবৃত্তি শুনুন (Recite)"}
-              </span>
-              <div className="absolute inset-0 bg-red-600/10 scale-x-0 group-hover:scale-x-100 transition-transform origin-left" />
+              {isLoadingAudio ? "প্রস্তুত হচ্ছে..." : "আবৃত্তি শুনুন (Recite)"}
             </button>
           )}
 
           {audioBuffer && (
-            <div className="w-full animate-in fade-in slide-in-from-bottom-4 duration-700 flex flex-col items-center z-20">
-               <AudioPlayer 
-                  audioBuffer={audioBuffer} 
-                  onPlayComplete={() => {}}
-                  onIntensityChange={handleIntensityChange}
-               />
+            <div className="w-full flex flex-col items-center z-20">
+               <AudioPlayer audioBuffer={audioBuffer} onPlayComplete={() => {}} onIntensityChange={handleIntensityChange} />
                <div className="flex flex-wrap justify-center gap-4 mt-6">
-                  <button 
-                    onClick={() => setAudioBuffer(null)}
-                    className="px-4 py-2 text-xs text-red-500/70 hover:text-red-400 uppercase tracking-widest border border-red-900/50 hover:border-red-400 transition-all rounded"
-                  >
-                    Edit Text
-                  </button>
-                  <button 
-                    onClick={handleDownload}
-                    disabled={isDownloading}
-                    className="px-4 py-2 text-xs bg-red-600/20 text-red-100 hover:bg-red-600/40 uppercase tracking-widest border border-red-500/50 transition-all rounded font-bold flex items-center gap-2 shadow-[0_0_10px_rgba(220,38,38,0.2)] disabled:opacity-50"
-                  >
+                  <button onClick={() => setAudioBuffer(null)} className="px-4 py-2 text-xs text-red-500/70 border border-red-900/50 rounded uppercase">Edit Text</button>
+                  <button onClick={handleDownload} disabled={isDownloading} className="px-4 py-2 text-xs bg-red-600/20 text-red-100 border border-red-500/50 rounded uppercase font-bold min-w-[160px] flex items-center justify-center">
                     {isDownloading ? (
                       <>
                         <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
-                        Encoding...
+                        Optimizing...
                       </>
                     ) : (
                       <>
@@ -355,12 +360,8 @@ const App: React.FC = () => {
                     )}
                   </button>
                </div>
-               <p className="text-center text-neutral-500 text-xs mt-4 tracking-widest uppercase">
-                 AI Voice: Gemini 2.5 Flash TTS
-               </p>
             </div>
           )}
-          
         </div>
       </div>
     </div>
